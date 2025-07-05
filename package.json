@@ -4,7 +4,7 @@
   "description": "Sync Apple Health workouts to Notion",
   "main": "index.js",
   "scripts": {
-    "build": "echo 'No build step required'",
+    "build": "mkdir -p public && echo 'Build complete'",
     "dev": "netlify dev"
   },
   "dependencies": {

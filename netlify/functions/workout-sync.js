@@ -4,203 +4,177 @@ const notion = new Client({
   auth: process.env.NOTION_TOKEN,
 });
 
-// Your Notion database ID (you'll set this as environment variable)
 const WORKOUT_DATABASE_ID = process.env.WORKOUT_DATABASE_ID;
+const STRAVA_CLIENT_ID = process.env.STRAVA_CLIENT_ID;
+const STRAVA_CLIENT_SECRET = process.env.STRAVA_CLIENT_SECRET;
+const STRAVA_ACCESS_TOKEN = process.env.STRAVA_ACCESS_TOKEN;
 
 export const handler = async (event, context) => {
-  // Set CORS headers for all responses
   const headers = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   };
 
-  // Handle preflight requests
-  if (event.httpMethod === 'OPTIONS') {
-    return {
-      statusCode: 200,
-      headers,
-      body: '',
-    };
-  }
-
-  if (event.httpMethod !== 'POST') {
-    return {
-      statusCode: 405,
-      headers,
-      body: JSON.stringify({ error: 'Method not allowed' }),
-    };
-  }
-
-  try {
-    const { workouts } = JSON.parse(event.body);
-    
-    if (!workouts || !Array.isArray(workouts)) {
+  // Handle webhook verification (required by Strava)
+  if (event.httpMethod === 'GET') {
+    const { 'hub.challenge': challenge } = event.queryStringParameters || {};
+    if (challenge) {
       return {
-        statusCode: 400,
+        statusCode: 200,
         headers,
-        body: JSON.stringify({ error: 'Invalid workout data' }),
+        body: JSON.stringify({ 'hub.challenge': challenge }),
       };
     }
+  }
 
-    // First, check for duplicates by querying existing workouts for today
-    const today = new Date().toISOString().split('T')[0];
-    const existingWorkouts = await notion.databases.query({
-      database_id: WORKOUT_DATABASE_ID,
-      filter: {
-        property: 'Date',
-        date: {
-          equals: today,
-        },
+  // Handle webhook events
+  if (event.httpMethod === 'POST') {
+    try {
+      const webhookData = JSON.parse(event.body);
+      console.log('Received Strava webhook:', webhookData);
+
+      // Only process activity creation events
+      if (webhookData.object_type === 'activity' && webhookData.aspect_type === 'create') {
+        const activityId = webhookData.object_id;
+        
+        // Fetch full activity details from Strava
+        const stravaActivity = await fetchStravaActivity(activityId);
+        
+        if (stravaActivity) {
+          // Check for duplicates in Notion
+          const isDuplicate = await checkForDuplicate(stravaActivity);
+          
+          if (!isDuplicate) {
+            // Create Notion entry
+            await createNotionEntry(stravaActivity);
+            console.log(`Created Notion entry for activity: ${stravaActivity.name}`);
+          } else {
+            console.log(`Activity already exists in Notion: ${stravaActivity.name}`);
+          }
+        }
+      }
+
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({ received: true }),
+      };
+
+    } catch (error) {
+      console.error('Error processing webhook:', error);
+      return {
+        statusCode: 500,
+        headers,
+        body: JSON.stringify({ error: error.message }),
+      };
+    }
+  }
+
+  return {
+    statusCode: 405,
+    headers,
+    body: JSON.stringify({ error: 'Method not allowed' }),
+  };
+};
+
+async function fetchStravaActivity(activityId) {
+  try {
+    const response = await fetch(`https://www.strava.com/api/v3/activities/${activityId}`, {
+      headers: {
+        'Authorization': `Bearer ${STRAVA_ACCESS_TOKEN}`,
       },
     });
 
-    const results = [];
-    const skipped = [];
-
-    for (const workout of workouts) {
-      const {
-        type,
-        duration, // in minutes
-        calories,
-        startDate,
-        endDate,
-        source = 'Apple Watch'
-      } = workout;
-
-      // Check if this exact workout already exists (same type, duration, start time)
-      const workoutStartTime = new Date(startDate).toISOString();
-      const isDuplicate = existingWorkouts.results.some(existing => {
-        const existingType = existing.properties['Specific Activity']?.rich_text?.[0]?.text?.content;
-        const existingDuration = existing.properties['Duration (Minutes)']?.number;
-        const existingStart = existing.properties['Start Time']?.rich_text?.[0]?.text?.content;
-        
-        return existingType === type && 
-               existingDuration === Math.round(duration) &&
-               existingStart === workoutStartTime;
-      });
-
-      if (isDuplicate) {
-        skipped.push({
-          workout: type,
-          duration: Math.round(duration),
-          reason: 'Already exists'
-        });
-        continue;
-      }
-
-      // Determine workout category for your system
-      const workoutCategory = categorizeWorkout(type);
-
-      // Create Notion database entry
-      const notionResponse = await notion.pages.create({
-        parent: {
-          database_id: WORKOUT_DATABASE_ID,
-        },
-        properties: {
-          'Date': {
-            date: {
-              start: new Date(startDate).toISOString().split('T')[0],
-            },
-          },
-          'Workout Type': {
-            select: {
-              name: workoutCategory,
-            },
-          },
-          'Specific Activity': {
-            rich_text: [
-              {
-                text: {
-                  content: type,
-                },
-              },
-            ],
-          },
-          'Duration (Minutes)': {
-            number: Math.round(duration),
-          },
-          'Calories': {
-            number: calories || 0,
-          },
-          'Source': {
-            select: {
-              name: source,
-            },
-          },
-          'Start Time': {
-            rich_text: [
-              {
-                text: {
-                  content: workoutStartTime,
-                },
-              },
-            ],
-          },
-        },
-      });
-
-      results.push({
-        workout: type,
-        duration: Math.round(duration),
-        category: workoutCategory,
-        notionId: notionResponse.id,
-      });
+    if (!response.ok) {
+      throw new Error(`Strava API error: ${response.status}`);
     }
 
-    // Return summary for the shortcut to display
-    const workoutSummary = results.map(r => 
-      `✅ ${r.workout}: ${r.duration}min → ${r.category}`
-    ).join('\n');
-
-    const skippedSummary = skipped.length > 0 ? 
-      `\n\nSkipped (duplicates):\n${skipped.map(s => `⏭️ ${s.workout}: ${s.duration}min`).join('\n')}` : '';
-
-    return {
-      statusCode: 200,
-      headers,
-      body: JSON.stringify({
-        success: true,
-        summary: `Processed ${workouts.length} workout(s)\nAdded: ${results.length} | Skipped: ${skipped.length}\n\n${workoutSummary}${skippedSummary}`,
-        added: results.length,
-        skipped: skipped.length,
-        workouts: results,
-        duplicates: skipped,
-      }),
-    };
-
+    return await response.json();
   } catch (error) {
-    console.error('Error processing workout:', error);
-    return {
-      statusCode: 500,
-      headers,
-      body: JSON.stringify({ 
-        error: 'Failed to process workout data',
-        details: error.message 
-      }),
-    };
+    console.error('Error fetching Strava activity:', error);
+    return null;
   }
-};
+}
 
-function categorizeWorkout(workoutType) {
-  const type = workoutType.toLowerCase();
+async function checkForDuplicate(stravaActivity) {
+  try {
+    const activityDate = new Date(stravaActivity.start_date).toISOString().split('T')[0];
+    
+    const existingActivities = await notion.databases.query({
+      database_id: WORKOUT_DATABASE_ID,
+      filter: {
+        and: [
+          {
+            property: 'Date',
+            date: { equals: activityDate }
+          },
+          {
+            property: 'Strava ID',
+            rich_text: { equals: stravaActivity.id.toString() }
+          }
+        ]
+      },
+    });
+
+    return existingActivities.results.length > 0;
+  } catch (error) {
+    console.error('Error checking for duplicates:', error);
+    return false;
+  }
+}
+
+async function createNotionEntry(stravaActivity) {
+  const workoutCategory = categorizeStravaActivity(stravaActivity.sport_type || stravaActivity.type);
+  const startDate = new Date(stravaActivity.start_date).toISOString().split('T')[0];
   
-  // Map Apple Health workout types to your Notion categories
+  const notionData = {
+    parent: { database_id: WORKOUT_DATABASE_ID },
+    properties: {
+      'Date': {
+        date: { start: startDate }
+      },
+      'Workout Type': {
+        select: { name: workoutCategory }
+      },
+      'Specific Activity': {
+        rich_text: [{ text: { content: stravaActivity.name } }]
+      },
+      'Duration (Minutes)': {
+        number: Math.round(stravaActivity.elapsed_time / 60)
+      },
+      'Calories': {
+        number: stravaActivity.calories || 0
+      },
+      'Source': {
+        select: { name: 'Strava' }
+      },
+      'Strava ID': {
+        rich_text: [{ text: { content: stravaActivity.id.toString() } }]
+      },
+      'Distance (km)': {
+        number: stravaActivity.distance ? Math.round(stravaActivity.distance / 1000 * 100) / 100 : 0
+      }
+    }
+  };
+
+  return await notion.pages.create(notionData);
+}
+
+function categorizeStravaActivity(activityType) {
+  const type = activityType.toLowerCase();
+  
   if (type.includes('yoga')) {
     return 'Yoga';
   }
   
-  if (type.includes('functional strength') || type.includes('strength') || 
-      type.includes('weight') || type.includes('lifting') || 
-      type.includes('bodybuilding') || type.includes('crosstraining')) {
+  if (type.includes('weight') || type.includes('strength') || 
+      type.includes('crosstraining') || type.includes('workout')) {
     return 'Lifting';
   }
   
-  if (type.includes('cardio') || type.includes('running') || 
-      type.includes('cycling') || type.includes('treadmill') ||
-      type.includes('bike') || type.includes('stair') || 
-      type.includes('hiit') || type.includes('rowing') ||
-      type.includes('elliptical') || type.includes('walking')) {
+  if (type.includes('run') || type.includes('ride') || type.includes('bike') ||
+      type.includes('swim') || type.includes('cardio') || type.includes('hiit')) {
     return 'Cardio';
   }
   

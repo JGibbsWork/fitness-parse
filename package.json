@@ -1,0 +1,19 @@
+{
+  "name": "workout-sync",
+  "version": "1.0.0",
+  "description": "Sync Apple Health workouts to Notion",
+  "main": "index.js",
+  "scripts": {
+    "build": "echo 'No build step required'",
+    "dev": "netlify dev"
+  },
+  "dependencies": {
+    "@notionhq/client": "^2.2.15"
+  },
+  "devDependencies": {
+    "netlify-cli": "^17.0.0"
+  },
+  "keywords": ["notion", "apple-health", "fitness"],
+  "author": "James Gibbs",
+  "license": "MIT"
+}
